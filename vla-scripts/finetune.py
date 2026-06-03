@@ -112,6 +112,7 @@ class FinetuneConfig:
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
     lora_rank: int = 32                              # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                        # Dropout applied to LoRA weights
+    lora_train_embeddings_and_lm_head: bool = False  # If True, also trains/saves token embeddings and LM head with LoRA
     merge_lora_during_training: bool = True          # If True, merges LoRA weights and saves result during training
                                                      #   Note: Merging can be very slow on some machines. If so, set to
                                                      #         False and merge final checkpoint offline!
@@ -178,6 +179,8 @@ def get_run_id(cfg) -> str:
         )
         if cfg.use_lora:
             run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+            if cfg.lora_train_embeddings_and_lm_head:
+                run_id += "+emb-lmhead"
         if cfg.use_annotation_prediction:
             run_id += f"+annotation-alpha{cfg.annotation_action_l1_alpha}"
         if cfg.use_annotation_margin_loss and cfg.annotation_margin_lambda > 0:
@@ -933,15 +936,19 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # LoRA setup
     if cfg.use_lora:
+        modules_to_save = ["embed_tokens", "lm_head"] if cfg.lora_train_embeddings_and_lm_head else None
         lora_config = LoraConfig(
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
             lora_dropout=cfg.lora_dropout,
             target_modules="all-linear",
             init_lora_weights="gaussian",
+            modules_to_save=modules_to_save,
         )
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+        if modules_to_save is not None:
+            print(f"Training and saving extra LoRA modules: {modules_to_save}")
 
     # FiLM setup
     if cfg.use_film:

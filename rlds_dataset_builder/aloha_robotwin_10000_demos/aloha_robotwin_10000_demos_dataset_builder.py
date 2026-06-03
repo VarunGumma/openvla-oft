@@ -12,6 +12,11 @@ from typing import Any, Iterator, Tuple
 import h5py
 import numpy as np
 import tensorflow_datasets as tfds
+from tensorflow_datasets.core.utils import gcs_utils
+
+# This is a local custom dataset. Disable TFDS' public GCS metadata lookup so
+# builder construction does not try to contact gs://tfds-data in offline clusters.
+gcs_utils._is_gcs_disabled = True
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from aloha1_put_X_into_pot_300_demos.conversion_utils import MultiThreadedDatasetBuilder  # noqa: E402
