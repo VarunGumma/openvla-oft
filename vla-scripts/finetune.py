@@ -55,6 +55,7 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
+    IGNORE_INDEX,
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
 )
@@ -78,6 +79,11 @@ class FinetuneConfig:
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
+    use_annotation_prediction: bool = False          # If True, predicts frame-level <opcodes> text before each action chunk
+    annotation_action_l1_alpha: float = 10.0         # Weight for L1 loss when frame-level annotation CE is present
+    use_annotation_margin_loss: bool = False         # If True, adds annotation-vs-control MSE hinge regularization
+    annotation_margin_lambda: float = 0.0            # Weight for annotation margin regularization
+    annotation_margin_gamma: float = 0.0             # Desired MSE margin between control and annotation-conditioned actions
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
@@ -172,6 +178,10 @@ def get_run_id(cfg) -> str:
         )
         if cfg.use_lora:
             run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+        if cfg.use_annotation_prediction:
+            run_id += f"+annotation-alpha{cfg.annotation_action_l1_alpha}"
+        if cfg.use_annotation_margin_loss and cfg.annotation_margin_lambda > 0:
+            run_id += f"+margin-lambda{cfg.annotation_margin_lambda}-gamma{cfg.annotation_margin_gamma}"
         if cfg.image_aug:
             run_id += "--image_aug"
         if cfg.run_id_note is not None:
@@ -281,6 +291,10 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    annotation_action_l1_alpha=10.0,
+    use_annotation_margin_loss=False,
+    annotation_margin_lambda=0.0,
+    annotation_margin_gamma=0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -301,6 +315,10 @@ def run_forward_pass(
         compute_diffusion_l1 (bool): Whether to sample actions and compute L1 loss for diffusion (do this once every
                                     diffusion_sample_freq steps during training; do it every batch for validation)
         num_diffusion_steps_train (int): Number of diffusion steps for training (only used for diffusion).
+        annotation_action_l1_alpha (float): Weight for L1 loss when annotation CE supervision is present.
+        use_annotation_margin_loss (bool): Whether to add the annotation-vs-control MSE hinge regularizer.
+        annotation_margin_lambda (float): Weight for the annotation margin regularizer.
+        annotation_margin_gamma (float): Target margin for control MSE minus annotation-conditioned MSE.
 
     Returns:
         tuple: (loss, metrics_dict)
@@ -308,6 +326,14 @@ def run_forward_pass(
             metrics_dict: Dictionary of computed metrics (detached values for logging).
     """
     metrics = {}
+    if "annotation_labels" in batch and not use_l1_regression:
+        raise ValueError("Frame-level annotation supervision currently requires --use_l1_regression True.")
+    if use_annotation_margin_loss and "annotation_labels" not in batch:
+        raise ValueError("Annotation margin loss requires --use_annotation_prediction True and annotation labels.")
+    if use_annotation_margin_loss and annotation_margin_lambda < 0:
+        raise ValueError("--annotation_margin_lambda must be non-negative.")
+    if use_annotation_margin_loss and annotation_margin_gamma < 0:
+        raise ValueError("--annotation_margin_gamma must be non-negative.")
 
     # Get ground-truth action labels
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
@@ -325,7 +351,7 @@ def run_forward_pass(
 
     # VLA forward pass
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        output: CausalLMOutputWithPast = vla(
+        vla_kwargs = dict(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
             pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
@@ -338,6 +364,9 @@ def run_forward_pass(
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
         )
+        if "annotation_labels" in batch:
+            vla_kwargs["annotation_labels"] = batch["annotation_labels"]
+        output: CausalLMOutputWithPast = vla(**vla_kwargs)
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
@@ -371,23 +400,69 @@ def run_forward_pass(
         )
     # Compute metrics for continuous action representations (L1 regression | diffusion)
     else:
-        # Get last layer hidden states
-        last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
-        # Get hidden states for text portion of prompt+response (after the vision patches)
-        text_hidden_states = last_hidden_states[:, num_patches:-1]
-        # Get hidden states for action portion of response
         batch_size = batch["input_ids"].shape[0]
-        actions_hidden_states = (
-            text_hidden_states[current_action_mask | next_actions_mask]
-            .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
-            .to(torch.bfloat16)
-        )  # (B, act_chunk_len, D)
+
+        def extract_actions_hidden_states(model_output):
+            # Get hidden states for the reserved action slots after projected vision patches.
+            last_hidden_states = model_output.hidden_states[-1]  # (B, seq_len, D)
+            text_hidden_states = last_hidden_states[:, num_patches:-1]
+            return (
+                text_hidden_states[current_action_mask | next_actions_mask]
+                .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
+                .to(torch.bfloat16)
+            )  # (B, act_chunk_len, D)
+
+        actions_hidden_states = extract_actions_hidden_states(output)
 
         if use_l1_regression:
             # Predict action
             predicted_actions = action_head.module.predict_action(actions_hidden_states)
             # Get full L1 loss
-            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            action_l1_loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            loss = action_l1_loss
+
+            if "annotation_labels" in batch:
+                annotation_labels = batch["annotation_labels"].to(output.logits.device)
+                patch_labels = torch.full(
+                    (annotation_labels.shape[0], num_patches),
+                    fill_value=IGNORE_INDEX,
+                    dtype=annotation_labels.dtype,
+                    device=annotation_labels.device,
+                )
+                multimodal_annotation_labels = torch.cat(
+                    [annotation_labels[:, :1], patch_labels, annotation_labels[:, 1:]],
+                    dim=1,
+                )
+                annotation_ce_loss = nn.functional.cross_entropy(
+                    output.logits[:, :-1].reshape(-1, output.logits.shape[-1]),
+                    multimodal_annotation_labels[:, 1:].reshape(-1),
+                    ignore_index=IGNORE_INDEX,
+                )
+                loss = annotation_ce_loss + annotation_action_l1_alpha * action_l1_loss
+                metrics["action_l1_loss"] = action_l1_loss.item()
+                metrics["annotation_ce_loss"] = annotation_ce_loss.item()
+
+                if use_annotation_margin_loss and annotation_margin_lambda > 0:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        control_vla_kwargs = dict(vla_kwargs)
+                        control_vla_kwargs["mask_annotation_attention"] = True
+                        control_output: CausalLMOutputWithPast = vla(**control_vla_kwargs)
+
+                    control_actions_hidden_states = extract_actions_hidden_states(control_output)
+                    control_predicted_actions = action_head.module.predict_action(control_actions_hidden_states)
+                    annotation_action_mse_loss = nn.functional.mse_loss(
+                        predicted_actions.float(), ground_truth_actions.float(), reduction="mean"
+                    )
+                    control_action_mse_loss = nn.functional.mse_loss(
+                        control_predicted_actions.float(), ground_truth_actions.float(), reduction="mean"
+                    )
+                    annotation_margin_loss = nn.functional.relu(
+                        annotation_margin_gamma - control_action_mse_loss + annotation_action_mse_loss
+                    )
+                    loss = loss + annotation_margin_lambda * annotation_margin_loss
+                    metrics["annotation_action_mse_loss"] = annotation_action_mse_loss.item()
+                    metrics["control_action_mse_loss"] = control_action_mse_loss.item()
+                    metrics["annotation_margin_loss"] = annotation_margin_loss.item()
 
         if use_diffusion:
             # Predict noise
@@ -718,12 +793,16 @@ def run_validation(
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
+                annotation_action_l1_alpha=cfg.annotation_action_l1_alpha,
                 use_diffusion=cfg.use_diffusion,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                use_annotation_margin_loss=cfg.use_annotation_margin_loss,
+                annotation_margin_lambda=cfg.annotation_margin_lambda,
+                annotation_margin_gamma=cfg.annotation_margin_gamma,
             )
 
             # Add the loss value to the metrics
@@ -770,6 +849,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    if cfg.use_annotation_prediction and not cfg.use_l1_regression:
+        raise ValueError("Annotation prediction currently requires --use_l1_regression True.")
+    if cfg.use_annotation_margin_loss and not cfg.use_annotation_prediction:
+        raise ValueError("Annotation margin loss requires --use_annotation_prediction True.")
+    if cfg.use_annotation_margin_loss and not cfg.use_l1_regression:
+        raise ValueError("Annotation margin loss currently requires --use_l1_regression True.")
+    if cfg.use_annotation_margin_loss and cfg.annotation_margin_lambda < 0:
+        raise ValueError("--annotation_margin_lambda must be non-negative.")
+    if cfg.use_annotation_margin_loss and cfg.annotation_margin_gamma < 0:
+        raise ValueError("--annotation_margin_gamma must be non-negative.")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -974,6 +1063,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         prompt_builder_fn=PurePromptBuilder,
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
+        use_annotation_prediction=cfg.use_annotation_prediction,
     )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -1027,6 +1117,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    if cfg.use_annotation_prediction:
+        recent_metrics["action_l1_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
+        recent_metrics["annotation_ce_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
+    if cfg.use_annotation_margin_loss and cfg.annotation_margin_lambda > 0:
+        recent_metrics["annotation_action_mse_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
+        recent_metrics["control_action_mse_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
+        recent_metrics["annotation_margin_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -1044,12 +1141,16 @@ def finetune(cfg: FinetuneConfig) -> None:
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
+                annotation_action_l1_alpha=cfg.annotation_action_l1_alpha,
                 use_diffusion=cfg.use_diffusion,
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                use_annotation_margin_loss=cfg.use_annotation_margin_loss,
+                annotation_margin_lambda=cfg.annotation_margin_lambda,
+                annotation_margin_gamma=cfg.annotation_margin_gamma,
             )
 
             # Normalize loss to account for gradient accumulation

@@ -112,9 +112,19 @@ class PaddedCollatorForActionPrediction:
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
         input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
         labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        if "annotation_labels" in instances[0]:
+            annotation_labels = pad_sequence(
+                [instance["annotation_labels"] for instance in instances],
+                batch_first=True,
+                padding_value=IGNORE_INDEX,
+            )
+        else:
+            annotation_labels = None
 
         # Truncate (if necessary)
         input_ids, labels = input_ids[:, : self.model_max_length], labels[:, : self.model_max_length]
+        if annotation_labels is not None:
+            annotation_labels = annotation_labels[:, : self.model_max_length]
 
         # Get `attention_mask` by checking for `pad_token_id`
         attention_mask = input_ids.ne(self.pad_token_id)
@@ -151,6 +161,8 @@ class PaddedCollatorForActionPrediction:
             labels=labels,
             actions=actions,
         )
+        if annotation_labels is not None:
+            output["annotation_labels"] = annotation_labels
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
         return output

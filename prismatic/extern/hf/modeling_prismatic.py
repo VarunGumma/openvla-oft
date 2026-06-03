@@ -20,6 +20,7 @@ import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+from transformers.models.llama.modeling_llama import LlamaSdpaAttention, apply_rotary_pos_emb, repeat_kv
 
 from prismatic.training.train_utils import (
     get_current_action_mask,
@@ -48,6 +49,106 @@ def unpack_tuple(fn: Callable[[Any], Tuple[Any]]) -> Callable[[Any], Any]:
         return result[0] if isinstance(result, tuple) else result
 
     return wrapper
+
+
+def _llama_sdpa_forward_with_optional_hybrid_mask(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value=None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+):
+    """Preserve row-specific masks only for annotation-aware action prediction."""
+    preserve_attention_mask_rows = getattr(self, "_openvla_preserve_attention_mask_rows", False) or getattr(
+        attention_mask, "_openvla_preserve_attention_mask_rows", False
+    )
+    if (
+        not preserve_attention_mask_rows
+        and attention_mask is not None
+        and attention_mask.ndim == 4
+        and attention_mask.shape[-2] > 1
+        and attention_mask.shape[-1] > 1
+    ):
+        # A hybrid prefix mask allows the BOS row to attend to the first
+        # projected image token. A regular causal mask never does.
+        preserve_attention_mask_rows = bool(torch.all(attention_mask[:, :, 0, 1] == 0))
+    if not preserve_attention_mask_rows:
+        return LlamaSdpaAttention._openvla_original_forward(
+            self,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+        )
+
+    if output_attentions:
+        return super(LlamaSdpaAttention, self).forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+        )
+
+    bsz, q_len, _ = hidden_states.size()
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    past_key_value = getattr(self, "past_key_value", past_key_value)
+    if past_key_value is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+    causal_mask = attention_mask
+    if causal_mask is not None:
+        causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+
+    if query_states.device.type == "cuda" and causal_mask is not None:
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        attn_mask=causal_mask,
+        dropout_p=self.attention_dropout if self.training else 0.0,
+        is_causal=False,
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+    attn_output = self.o_proj(attn_output)
+    return attn_output, None, past_key_value
+
+
+def _install_llama_sdpa_hybrid_mask_patch():
+    """Install the hybrid-mask wrapper only when annotation prediction is enabled."""
+    if getattr(LlamaSdpaAttention, "_openvla_hybrid_mask_patch", False):
+        return
+
+    LlamaSdpaAttention._openvla_original_forward = LlamaSdpaAttention.forward
+    LlamaSdpaAttention.forward = _llama_sdpa_forward_with_optional_hybrid_mask
+    LlamaSdpaAttention._openvla_hybrid_mask_patch = True
 
 
 # HF Transformers overwrites parameters with names containing `gamma`; we're going to patch VisionBackbone.LayerScale.
@@ -483,6 +584,81 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         return multimodal_embeddings, multimodal_attention_mask
 
+    def _build_hybrid_attention_mask(
+        self,
+        multimodal_attention_mask,
+        all_actions_mask,
+        annotation_mask,
+        num_projected_tokens,
+        dtype,
+        mask_annotation_tokens: bool = False,
+    ):
+        """Build a prefix-LM mask with causal annotation text and parallel action slots."""
+        if multimodal_attention_mask is None:
+            raise ValueError("Annotation-aware prediction requires an attention mask.")
+
+        device = multimodal_attention_mask.device
+        batch_size, sequence_length = multimodal_attention_mask.shape
+        patch_mask = torch.zeros((batch_size, num_projected_tokens), dtype=torch.bool, device=device)
+
+        def insert_projected_tokens(mask):
+            mask = mask.to(device=device, dtype=torch.bool)
+            return torch.cat([mask[:, :1], patch_mask, mask[:, 1:]], dim=1)
+
+        multimodal_action_mask = insert_projected_tokens(all_actions_mask)
+        multimodal_annotation_mask = insert_projected_tokens(annotation_mask)
+        min_value = torch.finfo(dtype).min
+        hybrid_mask = torch.full(
+            (batch_size, 1, sequence_length, sequence_length),
+            fill_value=min_value,
+            dtype=dtype,
+            device=device,
+        )
+        hybrid_mask = torch.triu(hybrid_mask, diagonal=1)
+
+        for batch_idx in range(batch_size):
+            annotation_indices = torch.where(multimodal_annotation_mask[batch_idx])[0]
+            action_indices = torch.where(multimodal_action_mask[batch_idx])[0]
+            if annotation_indices.numel() == 0:
+                raise ValueError("Annotation-aware prediction requires at least one annotation token.")
+            if action_indices.numel() == 0:
+                raise ValueError("Annotation-aware prediction requires reserved action slots.")
+
+            # The fixed image-and-language request is a bidirectional prefix.
+            # Annotation rows remain causal; action rows can attend to all slots.
+            context_end = annotation_indices[0].item()
+            action_end = action_indices[-1].item() + 1
+            hybrid_mask[batch_idx, 0, :context_end, :context_end] = 0
+            hybrid_mask[batch_idx, 0, action_indices, :action_end] = 0
+            if mask_annotation_tokens:
+                hybrid_mask[batch_idx, 0, :, annotation_indices] = min_value
+
+        key_padding_mask = ~multimodal_attention_mask[:, None, None, :].bool()
+        hybrid_mask.masked_fill_(key_padding_mask, min_value)
+        # Gradient checkpointing can recompute attention after the temporary
+        # layer flag is reset, so carry the intent on the saved mask as well.
+        hybrid_mask._openvla_preserve_attention_mask_rows = True
+        return hybrid_mask
+
+    def _set_preserve_attention_mask_rows(self, enabled):
+        """Tell the OFT SDPA fork not to collapse a hybrid mask to one row."""
+        for decoder_layer in self.language_model.model.layers:
+            self_attention = decoder_layer.self_attn
+            if enabled and "FlashAttention" in self_attention.__class__.__name__:
+                raise ValueError("Annotation-aware prediction requires SDPA or eager attention, not FlashAttention.")
+            if isinstance(self_attention, LlamaSdpaAttention):
+                self_attention._openvla_preserve_attention_mask_rows = enabled
+
+    def _run_language_model(self, preserve_attention_mask_rows=False, **kwargs):
+        """Run the LLM while optionally preserving row-specific hybrid attention."""
+        if preserve_attention_mask_rows:
+            _install_llama_sdpa_hybrid_mask_patch()
+        self._set_preserve_attention_mask_rows(preserve_attention_mask_rows)
+        try:
+            return self.language_model(**kwargs)
+        finally:
+            self._set_preserve_attention_mask_rows(False)
+
     def _build_multimodal_labels(self, labels, projected_patch_embeddings):
         """Build multimodal labels with IGNORE_INDEX for patch embeddings"""
         if labels is not None:
@@ -515,6 +691,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        annotation_labels=None,
+        mask_annotation_attention: bool = False,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -574,11 +752,21 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # Get input embeddings (from language model embeddings)
             input_embeddings = self.get_input_embeddings()(input_ids)  # (B, seq_len, D)
 
-            # Extract action masks
-            all_actions_mask = self._process_action_masks(labels)
+            # Annotation generation has no action slots yet. Training and
+            # action prediction provide labels that identify reserved slots.
+            all_actions_mask = (
+                self._process_action_masks(labels)
+                if labels is not None
+                else torch.zeros_like(input_ids, dtype=torch.bool)
+            )
+            action_slot_mask = all_actions_mask
 
-            # Extract the language portion of the input embeddings (i.e. remove the action tokens portion)
-            language_embeddings = input_embeddings[~all_actions_mask].reshape(
+            # FiLM conditions on the request, not teacher-forced annotation
+            # response tokens or reserved action slots.
+            film_exclusion_mask = all_actions_mask
+            if annotation_labels is not None:
+                film_exclusion_mask = film_exclusion_mask | (annotation_labels != IGNORE_INDEX)
+            language_embeddings = input_embeddings[~film_exclusion_mask].reshape(
                 input_embeddings.shape[0], -1, input_embeddings.shape[2]
             )  # (B, lang_seq_len, llm_dim)
 
@@ -624,23 +812,48 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
                 input_embeddings, projected_patch_embeddings, attention_mask
             )
+            language_model_attention_mask = multimodal_attention_mask
+            if annotation_labels is not None:
+                language_model_attention_mask = self._build_hybrid_attention_mask(
+                    multimodal_attention_mask=multimodal_attention_mask,
+                    all_actions_mask=action_slot_mask,
+                    annotation_mask=annotation_labels != IGNORE_INDEX,
+                    num_projected_tokens=projected_patch_embeddings.shape[1],
+                    dtype=multimodal_embeddings.dtype,
+                    mask_annotation_tokens=mask_annotation_attention,
+                )
 
             # Build labels for multimodal sequence if needed
             multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
 
             # Dispatch to language model
-            language_model_output = self.language_model(
-                input_ids=None,
-                attention_mask=multimodal_attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=multimodal_embeddings,
-                labels=multimodal_labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+            if annotation_labels is None:
+                language_model_output = self.language_model(
+                    input_ids=None,
+                    attention_mask=multimodal_attention_mask,
+                    position_ids=None,
+                    past_key_values=None,
+                    inputs_embeds=multimodal_embeddings,
+                    labels=multimodal_labels,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                )
+            else:
+                language_model_output = self._run_language_model(
+                    preserve_attention_mask_rows=True,
+                    input_ids=None,
+                    attention_mask=language_model_attention_mask,
+                    position_ids=None,
+                    past_key_values=None,
+                    inputs_embeds=multimodal_embeddings,
+                    labels=multimodal_labels,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                )
 
         # === Otherwise =>> Assume Invalid! ===
         elif (input_ids.shape[0] != pixel_values.shape[0]) or (inputs_embeds.shape[0] != pixel_values.shape[0]):
@@ -709,6 +922,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 "use_cache": kwargs.get("use_cache"),
             }
         )
+        for key in ("proprio", "proprio_projector", "use_film"):
+            if key in kwargs:
+                model_inputs[key] = kwargs[key]
 
         return model_inputs
 
@@ -884,9 +1100,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
+        annotation_mask=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
+        action_slot_mask = all_actions_mask
         all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
         input_embeddings = input_embeddings * ~all_actions_mask
 
@@ -894,20 +1112,44 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
             input_embeddings, projected_patch_embeddings, attention_mask
         )
+        language_model_attention_mask = multimodal_attention_mask
+        if annotation_mask is not None:
+            language_model_attention_mask = self._build_hybrid_attention_mask(
+                multimodal_attention_mask=multimodal_attention_mask,
+                all_actions_mask=action_slot_mask,
+                annotation_mask=annotation_mask,
+                num_projected_tokens=projected_patch_embeddings.shape[1],
+                dtype=multimodal_embeddings.dtype,
+            )
 
         # Forward pass through language model
-        language_model_output = self.language_model(
-            input_ids=None,
-            attention_mask=multimodal_attention_mask,
-            position_ids=None,
-            past_key_values=None,
-            inputs_embeds=multimodal_embeddings,
-            labels=None,
-            use_cache=None,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        if annotation_mask is None:
+            language_model_output = self.language_model(
+                input_ids=None,
+                attention_mask=multimodal_attention_mask,
+                position_ids=None,
+                past_key_values=None,
+                inputs_embeds=multimodal_embeddings,
+                labels=None,
+                use_cache=None,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        else:
+            language_model_output = self._run_language_model(
+                preserve_attention_mask_rows=True,
+                input_ids=None,
+                attention_mask=language_model_attention_mask,
+                position_ids=None,
+                past_key_values=None,
+                inputs_embeds=multimodal_embeddings,
+                labels=None,
+                use_cache=None,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
 
         # Extract hidden states for action tokens
         last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
@@ -950,6 +1192,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
+        add_prompt_empty_token: bool = True,
+        annotation_token_count: int = 0,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -962,6 +1206,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             action_head: Optional head for L1 regression or diffusion-based prediction
             noisy_action_projector: Projector for noisy actions in diffusion-based prediction
             use_film: Whether to use FiLM conditioning
+            add_prompt_empty_token: Whether to append the OpenVLA empty token used after the base prompt
+            annotation_token_count: Number of generated annotation tokens to exclude from FiLM conditioning
             **kwargs: Additional arguments including pixel_values and attention_mask
 
         Returns:
@@ -969,7 +1215,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
-        if not torch.all(input_ids[:, -1] == 29871):
+        if add_prompt_empty_token and not torch.all(input_ids[:, -1] == 29871):
             input_ids = torch.cat(
                 (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
             )
@@ -994,8 +1240,18 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         input_embeddings = self.get_input_embeddings()(input_ids)
         all_actions_mask = self._process_action_masks(labels)
 
-        # Extract language embeddings
-        language_embeddings = input_embeddings[~all_actions_mask].reshape(
+        # Extract language embeddings for FiLM conditioning. Generated
+        # annotation tokens remain in the causal transformer sequence, but are
+        # excluded here to match training without leaking response text.
+        film_exclusion_mask = all_actions_mask.clone()
+        annotation_mask = None
+        if annotation_token_count:
+            annotation_end = input_ids.shape[-1] - ACTION_DIM * NUM_ACTIONS_CHUNK - 1
+            annotation_start = annotation_end - annotation_token_count
+            annotation_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            annotation_mask[:, annotation_start:annotation_end] = True
+            film_exclusion_mask = film_exclusion_mask | annotation_mask
+        language_embeddings = input_embeddings[~film_exclusion_mask].reshape(
             input_embeddings.shape[0], -1, input_embeddings.shape[2]
         )
 
@@ -1050,6 +1306,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PATCHES,
                 NUM_PROMPT_TOKENS,
                 action_head,
+                annotation_mask,
             )
 
         # Unnormalize predicted actions

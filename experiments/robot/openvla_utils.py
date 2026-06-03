@@ -722,7 +722,7 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
-) -> List[np.ndarray]:
+) -> Union[List[np.ndarray], Dict[str, Any]]:
     """
     Generate action predictions with the VLA policy.
 
@@ -738,7 +738,7 @@ def get_vla_action(
         use_film: Whether to use FiLM
 
     Returns:
-        List[np.ndarray]: Predicted actions
+        Predicted actions, plus generated annotation text when annotation prediction is enabled
     """
     with torch.inference_mode():
 
@@ -777,13 +777,70 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
+        annotation = None
+        annotation_token_count = 0
+        if getattr(cfg, "predict_annotation", False):
+            if not cfg.use_l1_regression or cfg.use_diffusion:
+                raise ValueError("Annotation generation currently requires L1 regression without diffusion.")
+
+            open_tag_ids = processor.tokenizer.encode("<opcodes>", add_special_tokens=False)
+            close_tag_ids = processor.tokenizer.encode("</opcodes>", add_special_tokens=False)
+            if len(open_tag_ids) != 1 or len(close_tag_ids) != 1:
+                raise ValueError("Expected <opcodes> and </opcodes> to each be one added token.")
+
+            # Match the OpenVLA training prompt before autoregressive generation.
+            if not torch.all(inputs["input_ids"][:, -1] == 29871):
+                empty_token = torch.tensor([[29871]], dtype=inputs["input_ids"].dtype, device=inputs["input_ids"].device)
+                inputs["input_ids"] = torch.cat([inputs["input_ids"], empty_token], dim=1)
+                inputs["attention_mask"] = torch.cat(
+                    [
+                        inputs["attention_mask"],
+                        torch.ones_like(empty_token, dtype=inputs["attention_mask"].dtype),
+                    ],
+                    dim=1,
+                )
+
+            prompt_len = inputs["input_ids"].shape[-1]
+            generated_ids = vla.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                pixel_values=inputs["pixel_values"],
+                proprio=proprio,
+                proprio_projector=proprio_projector,
+                use_film=use_film,
+                do_sample=False,
+                use_cache=True,
+                max_new_tokens=cfg.max_annotation_tokens,
+                eos_token_id=close_tag_ids[0],
+                pad_token_id=processor.tokenizer.pad_token_id,
+            )
+            generated_annotation_ids = generated_ids[:, prompt_len:]
+            annotation_token_count = generated_annotation_ids.shape[-1]
+            if close_tag_ids[0] not in generated_annotation_ids[0]:
+                close_tag = torch.tensor(
+                    [[close_tag_ids[0]]],
+                    dtype=generated_ids.dtype,
+                    device=generated_ids.device,
+                )
+                generated_ids = torch.cat([generated_ids, close_tag], dim=1)
+                generated_annotation_ids = generated_ids[:, prompt_len:]
+                annotation_token_count = generated_annotation_ids.shape[-1]
+
+            annotation = processor.tokenizer.decode(
+                generated_annotation_ids[0],
+                skip_special_tokens=False,
+            )
+            annotation = annotation.removeprefix("<opcodes>").split("</opcodes>", 1)[0]
+            inputs["input_ids"] = generated_ids
+            inputs["attention_mask"] = torch.ones_like(generated_ids, dtype=inputs["attention_mask"].dtype)
+
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
             action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
         else:
             # Custom action head for continuous actions
-            action, _ = vla.predict_action(
+            predict_action_kwargs = dict(
                 **inputs,
                 unnorm_key=cfg.unnorm_key,
                 do_sample=False,
@@ -793,9 +850,18 @@ def get_vla_action(
                 action_head=action_head,
                 use_film=use_film,
             )
+            if getattr(cfg, "predict_annotation", False):
+                predict_action_kwargs.update(
+                    add_prompt_empty_token=False,
+                    annotation_token_count=annotation_token_count,
+                )
+            action, _ = vla.predict_action(**predict_action_kwargs)
 
     # Return action chunk as list of actions
-    return [action[i] for i in range(len(action))]
+    actions = [action[i] for i in range(len(action))]
+    if getattr(cfg, "predict_annotation", False):
+        return {"annotation": annotation, "actions": actions}
+    return actions
 
 
 def get_action_from_server(

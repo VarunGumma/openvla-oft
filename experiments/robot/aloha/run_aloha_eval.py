@@ -203,6 +203,9 @@ def run_episode(
                 log_message("Requerying model...", log_file)
                 model_query_start_time = time.time()
                 actions = get_action_from_server(observation, server_endpoint)
+                if isinstance(actions, dict):
+                    log_message(f"annotation: {actions['annotation']}", log_file)
+                    actions = actions["actions"]
                 actions = actions[: cfg.num_open_loop_steps]
                 total_model_query_time += time.time() - model_query_start_time
                 action_queue.extend(actions)

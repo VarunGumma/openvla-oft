@@ -47,6 +47,7 @@ def make_dataset_from_rlds(
     depth_obs_keys: Dict[str, Optional[str]] = {},
     state_obs_keys: List[Optional[str]] = (),
     language_key: Optional[str] = None,
+    annotation_key: Optional[str] = None,
     action_proprio_normalization_type: ACTION_PROPRIO_NORMALIZATION_TYPE,
     dataset_statistics: Optional[Union[dict, str]] = None,
     absolute_action_mask: Optional[List[bool]] = None,
@@ -94,6 +95,8 @@ def make_dataset_from_rlds(
             "observation" dict, concatenated, and mapped to "proprio". Inserts 1 element of padding for each None entry.
         language_key (str, optional): If provided, the "task" dict will contain the key "language_instruction",
             extracted from `traj[language_key]`.
+        annotation_key (str, optional): If provided, the "task" dict will contain the key "annotation",
+            extracted from `traj[annotation_key]`.
         action_proprio_normalization_type (str, optional): The type of normalization to perform on the action,
             proprio, or both. Can be "normal" (mean 0, std 1) or "bounds" (normalized to [-1, 1]).
         dataset_statistics: (dict|str, optional): dict (or path to JSON file) that contains dataset statistics
@@ -127,6 +130,8 @@ def make_dataset_from_rlds(
     REQUIRED_KEYS = {"observation", "action"}
     if language_key is not None:
         REQUIRED_KEYS.add(language_key)
+    if annotation_key is not None:
+        REQUIRED_KEYS.add(annotation_key)
 
     def restructure(traj):
         # apply a standardization function, if provided
@@ -178,6 +183,12 @@ def make_dataset_from_rlds(
                     f"Language key {language_key} has dtype {traj[language_key].dtype}, " "but it must be tf.string."
                 )
             task["language_instruction"] = traj.pop(language_key)
+        if annotation_key is not None:
+            if traj[annotation_key].dtype != tf.string:
+                raise ValueError(
+                    f"Annotation key {annotation_key} has dtype {traj[annotation_key].dtype}, " "but it must be tf.string."
+                )
+            task["annotation"] = traj.pop(annotation_key)
 
         traj = {
             "observation": new_obs,

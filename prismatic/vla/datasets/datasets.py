@@ -19,9 +19,26 @@ from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
 from prismatic.vla.action_tokenizer import ActionTokenizer
-from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
+from prismatic.vla.constants import (
+    ACTION_DIM,
+    ACTION_PROPRIO_NORMALIZATION_TYPE,
+    ACTION_TOKEN_BEGIN_IDX,
+    ACTION_TOKEN_END_IDX,
+    IGNORE_INDEX,
+    NUM_ACTIONS_CHUNK,
+    PROPRIO_DIM,
+    STOP_INDEX,
+)
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
+
+
+def _find_subsequence(sequence, subsequence):
+    for idx in range(len(sequence) - len(subsequence) + 1):
+        if sequence[idx : idx + len(subsequence)] == subsequence:
+            return idx
+    raise ValueError(f"Could not find token subsequence {subsequence} in tokenized prompt.")
+
 
 @dataclass
 class RLDSBatchTransform:
@@ -32,6 +49,7 @@ class RLDSBatchTransform:
     predict_stop_token: bool = True
     use_wrist_image: bool = False
     use_proprio: bool = False
+    use_annotation_prediction: bool = False
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
@@ -51,10 +69,17 @@ class RLDSBatchTransform:
         current_action_string = self.action_tokenizer(current_action)
         action_chunk_string = current_action_string + future_actions_string
         action_chunk_len = len(action_chunk_string)
+        annotation = None
+        annotation_response = ""
+        if self.use_annotation_prediction:
+            if "annotation" not in rlds_batch["task"]:
+                raise ValueError("Annotation prediction is enabled, but this dataset does not provide frame annotations.")
+            annotation = rlds_batch["task"]["annotation"].decode().strip()
+            annotation_response = f"<opcodes>{annotation}</opcodes>"
 
         conversation = [
             {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": action_chunk_string},
+            {"from": "gpt", "value": annotation_response + action_chunk_string},
         ]
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
@@ -62,18 +87,49 @@ class RLDSBatchTransform:
         # Tokenize (w/ `base_tokenizer`)
         input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
         labels = list(input_ids)
+        annotation_labels = None
 
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
+        if annotation is not None:
+            for tag in ("<opcodes>", "</opcodes>"):
+                if len(self.base_tokenizer.encode(tag, add_special_tokens=False)) != 1:
+                    raise ValueError(f"Expected {tag} to be one added token.")
+
+            num_action_tokens = actions.size
+            action_chunk_start = len(input_ids) - num_action_tokens - 1
+            action_chunk_token_ids = input_ids[action_chunk_start : action_chunk_start + num_action_tokens]
+            if not all(ACTION_TOKEN_BEGIN_IDX < token_id <= ACTION_TOKEN_END_IDX for token_id in action_chunk_token_ids):
+                raise ValueError("Action chunk contains token IDs outside the reserved action-token range.")
+
+            annotation_token_ids = self.base_tokenizer(
+                annotation_response, add_special_tokens=False
+            ).input_ids
+            annotation_start = _find_subsequence(input_ids, annotation_token_ids)
+            annotation_labels = [IGNORE_INDEX] * len(input_ids)
+            annotation_labels[annotation_start : annotation_start + len(annotation_token_ids)] = annotation_token_ids
+
+            labels = [IGNORE_INDEX] * len(input_ids)
+            labels[action_chunk_start : action_chunk_start + len(action_chunk_token_ids)] = action_chunk_token_ids
+            if self.predict_stop_token:
+                labels[-1] = input_ids[-1]
+            if len(input_ids) > self.base_tokenizer.model_max_length:
+                raise ValueError("Annotated prompt exceeds tokenizer.model_max_length and would truncate action slots.")
+
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
+        if annotation_labels is not None:
+            annotation_labels = torch.tensor(annotation_labels)
         pixel_values = self.image_transform(img)
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
-        if not self.predict_stop_token:
-            labels[-1] = IGNORE_INDEX
+        if annotation is None:
+            labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
+            if not self.predict_stop_token:
+                labels[-1] = IGNORE_INDEX
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        if annotation_labels is not None:
+            return_dict["annotation_labels"] = annotation_labels
 
         # Add additional inputs
         if self.use_wrist_image:

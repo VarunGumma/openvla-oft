@@ -63,6 +63,8 @@ class OpenVLAServer:
         self.action_head = None
         if cfg.use_l1_regression or cfg.use_diffusion:
             self.action_head = get_action_head(cfg, self.vla.llm_dim)
+        if getattr(cfg, "predict_annotation", False) and (not cfg.use_l1_regression or cfg.use_diffusion):
+            raise ValueError("Annotation generation currently requires --use_l1_regression True and --use_diffusion False.")
 
         # Check that the model contains the action un-normalization key
         assert cfg.unnorm_key in self.vla.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
@@ -128,6 +130,8 @@ class DeployConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 3                     # Number of images in the VLA input (default: 3)
     use_proprio: bool = True                         # Whether to include proprio state in input
+    predict_annotation: bool = False                 # Generate <opcodes> annotation text before predicting actions
+    max_annotation_tokens: int = 128                 # Maximum autoregressive annotation length
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
 

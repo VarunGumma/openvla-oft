@@ -9,7 +9,9 @@ from enum import Enum
 
 # Llama 2 token constants
 IGNORE_INDEX = -100
+# Reserved action-bin token IDs are (ACTION_TOKEN_BEGIN_IDX, ACTION_TOKEN_END_IDX].
 ACTION_TOKEN_BEGIN_IDX = 31743
+ACTION_TOKEN_END_IDX = 31999
 STOP_INDEX = 2  # '</s>'
 
 
