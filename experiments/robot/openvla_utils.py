@@ -21,6 +21,8 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 # Apply JSON numpy patch for serialization
 json_numpy.patch()
 
+import prismatic.extern.hf.configuration_prismatic as configuration_prismatic_module
+import prismatic.extern.hf.modeling_prismatic as modeling_prismatic_module
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -180,18 +182,17 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
     if not os.path.isdir(pretrained_checkpoint):
         return
 
-    # Find current files
-    curr_files = {"modeling_prismatic.py": None, "configuration_prismatic.py": None}
-
-    for root, _, files in os.walk("./prismatic/"):
-        for filename in curr_files.keys():
-            if filename in files and curr_files[filename] is None:
-                curr_files[filename] = os.path.join(root, filename)
+    # Use the exact Prismatic files imported by this process instead of
+    # searching relative to the launch cwd.
+    curr_files = {
+        "modeling_prismatic.py": modeling_prismatic_module.__file__,
+        "configuration_prismatic.py": configuration_prismatic_module.__file__,
+    }
 
     # Check and handle each file
     for filename, curr_filepath in curr_files.items():
         if curr_filepath is None:
-            print(f"WARNING: `{filename}` is not found anywhere in the current directory.")
+            print(f"WARNING: `{filename}` is not available from the imported Prismatic modules.")
             continue
 
         checkpoint_filepath = os.path.join(pretrained_checkpoint, filename)
