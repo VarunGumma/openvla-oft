@@ -111,6 +111,7 @@ class FinetuneConfig:
     # LoRA
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
     lora_rank: int = 32                              # Rank of LoRA weight matrix
+    lora_alpha: Optional[int] = None                 # LoRA alpha; defaults to min(lora_rank, 16) when unspecified
     lora_dropout: float = 0.0                        # Dropout applied to LoRA weights
     lora_train_embeddings_and_lm_head: bool = False  # If True, also trains/saves token embeddings and LM head with LoRA
     merge_lora_during_training: bool = True          # If True, merges LoRA weights and saves result during training
@@ -178,7 +179,8 @@ def get_run_id(cfg) -> str:
             f"+lr-{cfg.learning_rate}"
         )
         if cfg.use_lora:
-            run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+            lora_alpha = cfg.lora_alpha if cfg.lora_alpha is not None else min(cfg.lora_rank, 16)
+            run_id += f"+lora-r{cfg.lora_rank}+alpha-{lora_alpha}+dropout-{cfg.lora_dropout}"
             if cfg.lora_train_embeddings_and_lm_head:
                 run_id += "+emb-lmhead"
         if cfg.use_annotation_prediction:
@@ -937,9 +939,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # LoRA setup
     if cfg.use_lora:
         modules_to_save = ["embed_tokens", "lm_head"] if cfg.lora_train_embeddings_and_lm_head else None
+        lora_alpha = cfg.lora_alpha if cfg.lora_alpha is not None else min(cfg.lora_rank, 16)
         lora_config = LoraConfig(
             r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
+            lora_alpha=lora_alpha,
             lora_dropout=cfg.lora_dropout,
             target_modules="all-linear",
             init_lora_weights="gaussian",
