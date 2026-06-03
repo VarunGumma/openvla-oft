@@ -124,6 +124,7 @@ class FinetuneConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    console_log_freq: int = 10                       # Console logging frequency in optimizer steps; set <= 0 to disable
 
     # fmt: on
 
@@ -649,6 +650,50 @@ def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
         else:
             log_dict[f"{prefix}/{name.replace('_', ' ').title()}"] = value
     wandb_entity.log(log_dict, step=step)
+
+
+def compute_global_grad_norm(parameters) -> float:
+    """Compute global L2 grad norm without materializing fp32 copies of full gradients."""
+    total_norm_sq = None
+    for param in parameters:
+        if param.grad is None:
+            continue
+        param_norm = param.grad.detach().norm(2).float()
+        param_norm_sq = param_norm * param_norm
+        total_norm_sq = param_norm_sq if total_norm_sq is None else total_norm_sq + param_norm_sq
+
+    if total_norm_sq is None:
+        return 0.0
+    return total_norm_sq.sqrt().item()
+
+
+def format_console_metrics(metrics: Dict[str, float], step: int) -> str:
+    """Format high-signal training metrics for console logging."""
+    display_names = {
+        "loss_value": "loss",
+        "action_l1_loss": "action_l1",
+        "annotation_ce_loss": "annot_ce",
+        "annotation_margin_loss": "margin",
+        "curr_action_l1_loss": "curr_l1",
+        "next_actions_l1_loss": "next_l1",
+        "grad_norm": "grad_norm",
+        "learning_rate": "lr",
+    }
+    ordered_keys = [
+        "loss_value",
+        "action_l1_loss",
+        "annotation_ce_loss",
+        "annotation_margin_loss",
+        "curr_action_l1_loss",
+        "next_actions_l1_loss",
+        "grad_norm",
+        "learning_rate",
+    ]
+    parts = [f"step={step}"]
+    for key in ordered_keys:
+        if key in metrics:
+            parts.append(f"{display_names[key]}={metrics[key]:.4g}")
+    return " | ".join(parts)
 
 
 def save_training_checkpoint(
@@ -1203,7 +1248,25 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
 
             # Optimizer and LR scheduler step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+            is_optimizer_step = (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+            if is_optimizer_step:
+                grad_norm = compute_global_grad_norm(trainable_params)
+                console_metrics = {
+                    **smoothened_metrics,
+                    "grad_norm": grad_norm,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                }
+                if distributed_state.is_main_process:
+                    progress.set_postfix(
+                        {
+                            "loss": f"{console_metrics.get('loss_value', 0.0):.4g}",
+                            "grad": f"{grad_norm:.4g}",
+                            "lr": f"{console_metrics['learning_rate']:.3g}",
+                        }
+                    )
+                    if cfg.console_log_freq > 0 and log_step % cfg.console_log_freq == 0:
+                        tqdm.tqdm.write(format_console_metrics(console_metrics, log_step))
+
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
