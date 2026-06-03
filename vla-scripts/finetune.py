@@ -5,6 +5,7 @@ Fine-tunes OpenVLA via LoRA.
 """
 
 import os
+import json
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -105,6 +106,7 @@ class FinetuneConfig:
                                                      #   (If False, saves all checkpoints)
     resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    resume_base_vla_path: Optional[str] = None        # Base VLA path to load before applying checkpoint LoRA adapter
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -208,10 +210,90 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     Returns:
         dict: PyTorch model state dictionary.
     """
-    checkpoint_path = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
+    checkpoint_path = resolve_checkpoint_file(path, module_name, step)
     print(f"Loading checkpoint: {checkpoint_path}")
     state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
     return remove_ddp_in_checkpoint(state_dict)
+
+
+def resolve_checkpoint_file(path: str, module_name: str, step: int) -> str:
+    """Resolves a numbered component checkpoint, falling back to latest-checkpoint naming."""
+    checkpoint_dir = Path(path)
+    checkpoint_path = checkpoint_dir / f"{module_name}--{step}_checkpoint.pt"
+    if checkpoint_path.exists():
+        return str(checkpoint_path)
+
+    latest_checkpoint_path = checkpoint_dir / f"{module_name}--latest_checkpoint.pt"
+    if latest_checkpoint_path.exists():
+        return str(latest_checkpoint_path)
+
+    raise FileNotFoundError(
+        f"Missing checkpoint for `{module_name}`. Tried:\n"
+        f"  - {checkpoint_path}\n"
+        f"  - {latest_checkpoint_path}"
+    )
+
+
+def load_resume_metadata(path: str) -> Dict:
+    metadata_path = Path(path) / "resume_metadata.json"
+    if not metadata_path.exists():
+        return {}
+    with open(metadata_path, "r") as f:
+        return json.load(f)
+
+
+def get_embedding_num_embeddings(module: nn.Module, embedding_type: str) -> Optional[int]:
+    if embedding_type == "input":
+        embeddings = module.get_input_embeddings()
+    elif embedding_type == "output":
+        embeddings = module.get_output_embeddings()
+    else:
+        raise ValueError(f"Unsupported embedding type: {embedding_type}")
+
+    if embeddings is None or not hasattr(embeddings, "weight"):
+        return None
+    return int(embeddings.weight.shape[0])
+
+
+def resize_vla_token_embeddings_for_resume(vla: nn.Module, processor, resume_metadata: Dict) -> None:
+    desired_num_embeddings = resume_metadata.get("input_embedding_num_embeddings")
+    if desired_num_embeddings is None:
+        desired_num_embeddings = len(processor.tokenizer)
+
+    current_num_embeddings = get_embedding_num_embeddings(vla, "input")
+    if current_num_embeddings == desired_num_embeddings:
+        return
+
+    print(
+        "Resizing base VLA token embeddings before loading LoRA adapter: "
+        f"{current_num_embeddings} -> {desired_num_embeddings}"
+    )
+    vla.resize_token_embeddings(int(desired_num_embeddings))
+
+
+def load_training_state(
+    path: str,
+    step: int,
+    optimizer: torch.optim.Optimizer,
+    scheduler: MultiStepLR,
+    device_id: int,
+) -> None:
+    """Loads optimizer and LR scheduler state for an exact training-state resume."""
+    try:
+        optimizer_path = resolve_checkpoint_file(path, "optimizer", step)
+        scheduler_path = resolve_checkpoint_file(path, "scheduler", step)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Cannot resume exact training state because optimizer/scheduler state is missing. "
+            "This checkpoint was likely saved before optimizer/scheduler state was included. "
+            "Resume from a newer checkpoint, or restart/continue without exact optimizer state."
+        ) from exc
+
+    map_location = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
+    print(f"Loading optimizer state: {optimizer_path}")
+    optimizer.load_state_dict(torch.load(optimizer_path, weights_only=False, map_location=map_location))
+    print(f"Loading scheduler state: {scheduler_path}")
+    scheduler.load_state_dict(torch.load(scheduler_path, weights_only=False, map_location=map_location))
 
 
 def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
@@ -702,6 +784,9 @@ def save_training_checkpoint(
     log_step,
     vla,
     processor,
+    optimizer,
+    scheduler,
+    base_vla_path,
     proprio_projector,
     noisy_action_projector,
     action_head,
@@ -717,6 +802,9 @@ def save_training_checkpoint(
         log_step (int): Current logging step.
         vla (OpenVLAForActionPrediction): Vision-language-action policy.
         processor (PrismaticProcessor): OpenVLA inputs processor.
+        optimizer (torch.optim.Optimizer): Optimizer whose state should be saved for resume.
+        scheduler (MultiStepLR): LR scheduler whose state should be saved for resume.
+        base_vla_path (str): Base VLA path to use when merging LoRA weights.
         proprio_projector (nn.Module): Proprioceptive state projector module.
         noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
         action_head (nn.Module): Action head module.
@@ -741,6 +829,21 @@ def save_training_checkpoint(
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(adapter_dir, exist_ok=True)
         save_dataset_statistics(train_dataset.dataset_statistics, checkpoint_dir)
+        resume_metadata = {
+            "checkpoint_step": log_step,
+            "base_vla_path": str(base_vla_path),
+            "uses_lora": cfg.use_lora,
+            "uses_l1_regression": cfg.use_l1_regression,
+            "uses_diffusion": cfg.use_diffusion,
+            "uses_film": cfg.use_film,
+            "uses_proprio": cfg.use_proprio,
+            "num_images_in_input": cfg.num_images_in_input,
+            "lora_modules_to_save_embed_tokens": cfg.lora_modules_to_save_embed_tokens,
+            "input_embedding_num_embeddings": get_embedding_num_embeddings(vla.module, "input"),
+            "output_embedding_num_embeddings": get_embedding_num_embeddings(vla.module, "output"),
+        }
+        with open(checkpoint_dir / "resume_metadata.json", "w") as f:
+            json.dump(resume_metadata, f, indent=2)
         print(f"Saving Model Checkpoint for Step {log_step}")
 
     # Wait for directories to be created
@@ -751,6 +854,9 @@ def save_training_checkpoint(
         # Save processor and LoRA adapter
         processor.save_pretrained(checkpoint_dir)
         vla.module.save_pretrained(adapter_dir)
+        check_model_logic_mismatch(checkpoint_dir)
+        torch.save(optimizer.state_dict(), checkpoint_dir / f"optimizer--{checkpoint_name_suffix}")
+        torch.save(scheduler.state_dict(), checkpoint_dir / f"scheduler--{checkpoint_name_suffix}")
 
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
@@ -777,13 +883,15 @@ def save_training_checkpoint(
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
         base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+            base_vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
         )
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
 
         if distributed_state.is_main_process:
             merged_vla.save_pretrained(checkpoint_dir)
+            update_auto_map(checkpoint_dir)
+            check_model_logic_mismatch(checkpoint_dir)
             print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
 
         # Wait for merged model to be saved
@@ -912,6 +1020,31 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
+    if cfg.resume_base_vla_path is not None:
+        cfg.resume_base_vla_path = cfg.resume_base_vla_path.rstrip("/")
+    if cfg.resume and not os.path.isdir(cfg.vla_path):
+        raise ValueError(f"--vla_path must point to a checkpoint directory when --resume True. Got: {cfg.vla_path}")
+
+    resume_metadata = load_resume_metadata(cfg.vla_path) if cfg.resume else {}
+    if cfg.resume and cfg.resume_step is None and resume_metadata.get("checkpoint_step") is not None:
+        cfg.resume_step = int(resume_metadata["checkpoint_step"])
+    if cfg.resume and cfg.resume_step is None:
+        raise ValueError("--resume_step must be set when --resume True, unless resume_metadata.json has checkpoint_step.")
+    if cfg.resume and cfg.resume_base_vla_path is None and resume_metadata.get("base_vla_path"):
+        cfg.resume_base_vla_path = resume_metadata["base_vla_path"].rstrip("/")
+
+    if cfg.resume and cfg.use_lora:
+        adapter_dir = Path(cfg.vla_path) / "lora_adapter"
+        if not adapter_dir.exists():
+            raise FileNotFoundError(f"Cannot resume LoRA training because no adapter was found at: {adapter_dir}")
+        if cfg.resume_base_vla_path is None:
+            raise ValueError(
+                "LoRA resume requires the original base OpenVLA checkpoint so the saved adapter is applied exactly once. "
+                "Pass --resume_base_vla_path, or resume from a checkpoint that contains resume_metadata.json."
+            )
+
+    model_load_path = cfg.resume_base_vla_path if (cfg.resume and cfg.resume_base_vla_path is not None) else cfg.vla_path
+
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
     # Get experiment run ID
@@ -949,11 +1082,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     # the `modeling_prismatic.py` file in this codebase; if so, we will copy
     # the file to the downloaded or locally stored checkpoint directory so
     # that the user's changes to the VLA class logic go into effect
-    if model_is_on_hf_hub(cfg.vla_path):
+    if model_is_on_hf_hub(model_load_path):
         # Download model directly from Hugging Face Hub
-        vla_download_path = snapshot_download(repo_id=cfg.vla_path)
-        # Overwrite VLA path
-        cfg.vla_path = vla_download_path
+        vla_download_path = snapshot_download(repo_id=model_load_path)
+        # Overwrite VLA path only for fresh runs; resume keeps cfg.vla_path as the checkpoint directory.
+        model_load_path = vla_download_path
+        if not cfg.resume:
+            cfg.vla_path = vla_download_path
     else:
         # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
         AutoConfig.register("openvla", OpenVLAConfig)
@@ -963,16 +1098,17 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Update config.json and sync model files
     if distributed_state.is_main_process:
-        update_auto_map(cfg.vla_path)
-        check_model_logic_mismatch(cfg.vla_path)
+        update_auto_map(model_load_path)
+        check_model_logic_mismatch(model_load_path)
 
     # Wait for model files to be synced
     dist.barrier()
 
     # Load processor and VLA
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    processor_load_path = cfg.vla_path if cfg.resume else model_load_path
+    processor = AutoProcessor.from_pretrained(processor_load_path, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
+        model_load_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
@@ -980,23 +1116,30 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+    if cfg.resume and cfg.use_lora:
+        resize_vla_token_embeddings_for_resume(vla, processor, resume_metadata)
 
     # LoRA setup
     if cfg.use_lora:
-        modules_to_save = ["embed_tokens"] if cfg.lora_modules_to_save_embed_tokens else None
-        lora_alpha = cfg.lora_alpha if cfg.lora_alpha is not None else min(cfg.lora_rank, 16)
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
-            modules_to_save=modules_to_save,
-        )
-        vla = get_peft_model(vla, lora_config)
+        if cfg.resume:
+            adapter_dir = Path(cfg.vla_path) / "lora_adapter"
+            print(f"Loading trainable LoRA adapter from: {adapter_dir}")
+            vla = PeftModel.from_pretrained(vla, adapter_dir, is_trainable=True)
+        else:
+            modules_to_save = ["embed_tokens"] if cfg.lora_modules_to_save_embed_tokens else None
+            lora_alpha = cfg.lora_alpha if cfg.lora_alpha is not None else min(cfg.lora_rank, 16)
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=cfg.lora_dropout,
+                target_modules="all-linear",
+                init_lora_weights="gaussian",
+                modules_to_save=modules_to_save,
+            )
+            vla = get_peft_model(vla, lora_config)
+            if modules_to_save is not None:
+                print(f"Training and saving extra LoRA modules: {modules_to_save}")
         vla.print_trainable_parameters()
-        if modules_to_save is not None:
-            print(f"Training and saving extra LoRA modules: {modules_to_save}")
 
     # FiLM setup
     if cfg.use_film:
@@ -1087,6 +1230,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
+    if cfg.resume:
+        load_training_state(cfg.vla_path, cfg.resume_step, optimizer, scheduler, device_id)
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -1181,7 +1326,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         recent_metrics["annotation_margin_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    initial_progress = cfg.resume_step if (cfg.resume and cfg.resume_step is not None) else 0
+    with tqdm.tqdm(total=cfg.max_steps, initial=initial_progress, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -1231,8 +1377,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-            if cfg.lr_warmup_steps > 0:
-                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+            if cfg.lr_warmup_steps > 0 and log_step < cfg.lr_warmup_steps:
+                lr_progress = min((log_step + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_lr
@@ -1242,7 +1388,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
                 wandb.log(
                     {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+                        "VLA Train/Learning Rate": optimizer.param_groups[0]["lr"],
                     },
                     step=log_step,
                 )
@@ -1280,6 +1426,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     vla=vla,
                     processor=processor,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    base_vla_path=model_load_path,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,

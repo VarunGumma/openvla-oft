@@ -15,6 +15,7 @@ Usage:
 """
 
 import os
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ import torch
 from peft import PeftModel
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
+from experiments.robot.openvla_utils import check_model_logic_mismatch, update_auto_map
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -40,6 +42,18 @@ class ConvertConfig:
     # fmt: on
 
 
+def get_resume_num_embeddings(checkpoint_dir: Union[str, Path]) -> int:
+    metadata_path = os.path.join(checkpoint_dir, "resume_metadata.json")
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        if metadata.get("input_embedding_num_embeddings") is not None:
+            return int(metadata["input_embedding_num_embeddings"])
+
+    processor = AutoProcessor.from_pretrained(checkpoint_dir, trust_remote_code=True)
+    return len(processor.tokenizer)
+
+
 @draccus.wrap()
 def main(cfg: ConvertConfig) -> None:
     # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
@@ -47,6 +61,9 @@ def main(cfg: ConvertConfig) -> None:
     AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+    update_auto_map(cfg.base_checkpoint)
+    check_model_logic_mismatch(cfg.base_checkpoint)
 
     # Load Model using HF AutoClasses
     print(f"Loading base model: {cfg.base_checkpoint}")
@@ -56,6 +73,14 @@ def main(cfg: ConvertConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    desired_num_embeddings = get_resume_num_embeddings(cfg.lora_finetuned_checkpoint_dir)
+    current_num_embeddings = int(vla.get_input_embeddings().weight.shape[0])
+    if current_num_embeddings != desired_num_embeddings:
+        print(
+            "Resizing base VLA token embeddings before loading LoRA adapter: "
+            f"{current_num_embeddings} -> {desired_num_embeddings}"
+        )
+        vla.resize_token_embeddings(desired_num_embeddings)
 
     # Load LoRA weights and merge into base model, then save final checkpoint
     print("Merging LoRA weights into base model...")
@@ -65,6 +90,8 @@ def main(cfg: ConvertConfig) -> None:
     )
     merged_vla = merged_vla.merge_and_unload()
     merged_vla.save_pretrained(cfg.lora_finetuned_checkpoint_dir)
+    update_auto_map(cfg.lora_finetuned_checkpoint_dir)
+    check_model_logic_mismatch(cfg.lora_finetuned_checkpoint_dir)
     print(f"\nMerging complete! Time elapsed (sec): {time.time() - start_time}")
     print(f"\nSaved merged model checkpoint at:\n{cfg.lora_finetuned_checkpoint_dir}")
 
