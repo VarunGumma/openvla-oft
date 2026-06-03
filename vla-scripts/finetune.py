@@ -87,6 +87,7 @@ class FinetuneConfig:
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
+    attn_implementation: Optional[str] = None        # Optional HF attention backend, e.g. flash_attention_2, sdpa, eager
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
 
@@ -184,6 +185,8 @@ def get_run_id(cfg) -> str:
             run_id += f"+lora-r{cfg.lora_rank}+alpha-{lora_alpha}+dropout-{cfg.lora_dropout}"
             if cfg.lora_train_embeddings_and_lm_head:
                 run_id += "+emb-lmhead"
+        if cfg.attn_implementation is not None:
+            run_id += f"+attn-{cfg.attn_implementation}"
         if cfg.use_annotation_prediction:
             run_id += f"+annotation-alpha{cfg.annotation_action_l1_alpha}"
         if cfg.use_annotation_margin_loss and cfg.annotation_margin_lambda > 0:
@@ -971,12 +974,23 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Load processor and VLA
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device_id)
+    model_load_kwargs = {
+        "torch_dtype": torch.bfloat16,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+    }
+    if cfg.attn_implementation is not None:
+        model_load_kwargs["attn_implementation"] = cfg.attn_implementation
+    vla = AutoModelForVision2Seq.from_pretrained(cfg.vla_path, **model_load_kwargs).to(device_id)
+    first_attn_class_name = vla.language_model.model.layers[0].self_attn.__class__.__name__
+    if cfg.use_annotation_prediction and "FlashAttention" in first_attn_class_name:
+        raise ValueError("Annotation prediction uses hybrid attention masks; use --attn_implementation sdpa or eager.")
+    if distributed_state.is_main_process:
+        print(
+            "Loaded attention backend:\n"
+            f"\tconfig._attn_implementation: {getattr(vla.config, '_attn_implementation', None)}\n"
+            f"\tfirst self-attention class: {first_attn_class_name}"
+        )
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)

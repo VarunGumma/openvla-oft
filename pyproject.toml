@@ -12,7 +12,7 @@ authors = [
 description = "Fine-Tuning Vision-Language-Action Models: Optimizing Speed and Success"
 version = "0.0.1"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 keywords = ["vision-language-actions models", "fine-tuning", "robot learning"]
 license = {file = "LICENSE"}
 classifiers = [
@@ -23,6 +23,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3 :: Only",
@@ -33,11 +34,11 @@ dependencies = [
     "draccus==0.8.0",
     "einops",
     # "flash_attn==2.5.5",      # Here for documentation -- install *AFTER* editable install (follow README)
-    "huggingface_hub>=0.25.0",
+    "huggingface_hub",
     "json-numpy",
     "jsonlines",
     "matplotlib",
-    "peft==0.16.0",
+    "peft==0.11.1",
     "protobuf",
     "rich",
     "sentencepiece==0.1.99",
