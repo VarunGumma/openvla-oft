@@ -97,6 +97,7 @@ class FinetuneConfig:
     lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
     num_steps_before_decay: int = 100_000            # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
+    max_grad_norm: float = 1.0                       # Max global grad norm for clipping; set <= 0 to disable
     max_steps: int = 200_000                         # Max number of training steps
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
     val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
@@ -1395,6 +1396,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             is_optimizer_step = (batch_idx + 1) % cfg.grad_accumulation_steps == 0
             if is_optimizer_step:
                 grad_norm = compute_global_grad_norm(trainable_params)
+                if cfg.max_grad_norm and cfg.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=cfg.max_grad_norm)
                 console_metrics = {
                     **smoothened_metrics,
                     "grad_norm": grad_norm,
