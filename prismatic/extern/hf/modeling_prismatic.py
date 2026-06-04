@@ -547,6 +547,17 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         # Project patch embeddings into language embedding space
         return self.projector(patch_features)
 
+    def _get_film_language_embeddings(self, input_embeddings, exclusion_mask, attention_mask):
+        """Average non-excluded, non-padding language embeddings for FiLM."""
+        keep_mask = ~exclusion_mask
+        if attention_mask is not None:
+            keep_mask = keep_mask & attention_mask.bool()
+
+        keep_mask_f = keep_mask.unsqueeze(-1).to(input_embeddings.dtype)
+        token_counts = keep_mask_f.sum(dim=1).clamp_min(1.0)
+        average_language_embedding = (input_embeddings * keep_mask_f).sum(dim=1) / token_counts
+        return average_language_embedding.unsqueeze(1)
+
     def _process_proprio_features(self, projected_patch_embeddings, proprio, proprio_projector):
         """Process proprioceptive features and append to vision features"""
         if proprio_projector is not None and proprio is not None:
@@ -766,9 +777,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             film_exclusion_mask = all_actions_mask
             if annotation_labels is not None:
                 film_exclusion_mask = film_exclusion_mask | (annotation_labels != IGNORE_INDEX)
-            language_embeddings = input_embeddings[~film_exclusion_mask].reshape(
-                input_embeddings.shape[0], -1, input_embeddings.shape[2]
-            )  # (B, lang_seq_len, llm_dim)
+            language_embeddings = self._get_film_language_embeddings(
+                input_embeddings, film_exclusion_mask, attention_mask
+            )
 
             # Get visual features
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
@@ -1251,8 +1262,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             annotation_mask = torch.zeros_like(input_ids, dtype=torch.bool)
             annotation_mask[:, annotation_start:annotation_end] = True
             film_exclusion_mask = film_exclusion_mask | annotation_mask
-        language_embeddings = input_embeddings[~film_exclusion_mask].reshape(
-            input_embeddings.shape[0], -1, input_embeddings.shape[2]
+        language_embeddings = self._get_film_language_embeddings(
+            input_embeddings, film_exclusion_mask, attention_mask
         )
 
         # Process vision features
