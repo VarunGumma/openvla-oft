@@ -82,9 +82,9 @@ class FinetuneConfig:
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
     use_annotation_prediction: bool = False          # If True, predicts frame-level <opcodes> text before each action chunk
     annotation_action_l1_alpha: float = 10.0         # Weight for L1 loss when frame-level annotation CE is present
-    use_annotation_margin_loss: bool = False         # If True, adds annotation-vs-control MSE hinge regularization
+    use_annotation_margin_loss: bool = False         # If True, adds annotation-vs-control action-loss hinge regularization
     annotation_margin_lambda: float = 0.0            # Weight for annotation margin regularization
-    annotation_margin_gamma: float = 0.0             # Desired MSE margin between control and annotation-conditioned actions
+    annotation_margin_gamma: float = 0.0             # Desired action-loss margin between control and annotation-conditioned actions
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
@@ -404,9 +404,9 @@ def run_forward_pass(
                                     diffusion_sample_freq steps during training; do it every batch for validation)
         num_diffusion_steps_train (int): Number of diffusion steps for training (only used for diffusion).
         annotation_action_l1_alpha (float): Weight for L1 loss when annotation CE supervision is present.
-        use_annotation_margin_loss (bool): Whether to add the annotation-vs-control MSE hinge regularizer.
+        use_annotation_margin_loss (bool): Whether to add the annotation-vs-control action-loss hinge regularizer.
         annotation_margin_lambda (float): Weight for the annotation margin regularizer.
-        annotation_margin_gamma (float): Target margin for control MSE minus annotation-conditioned MSE.
+        annotation_margin_gamma (float): Target margin for control action loss minus annotation-conditioned action loss.
 
     Returns:
         tuple: (loss, metrics_dict)
@@ -531,25 +531,23 @@ def run_forward_pass(
                 metrics["annotation_ce_loss"] = annotation_ce_loss.item()
 
                 if use_annotation_margin_loss and annotation_margin_lambda > 0:
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                         control_vla_kwargs = dict(vla_kwargs)
                         control_vla_kwargs["mask_annotation_attention"] = True
                         control_output: CausalLMOutputWithPast = vla(**control_vla_kwargs)
 
-                    control_actions_hidden_states = extract_actions_hidden_states(control_output)
-                    control_predicted_actions = action_head.module.predict_action(control_actions_hidden_states)
-                    annotation_action_mse_loss = nn.functional.mse_loss(
-                        predicted_actions.float(), ground_truth_actions.float(), reduction="mean"
-                    )
-                    control_action_mse_loss = nn.functional.mse_loss(
-                        control_predicted_actions.float(), ground_truth_actions.float(), reduction="mean"
-                    )
+                        control_actions_hidden_states = extract_actions_hidden_states(control_output)
+                        control_predicted_actions = action_head.module.predict_action(control_actions_hidden_states)
+                        control_action_l1_loss = nn.functional.l1_loss(
+                            ground_truth_actions, control_predicted_actions, reduction="mean"
+                        )
+                    annotation_action_l1_loss = action_l1_loss
                     annotation_margin_loss = nn.functional.relu(
-                        annotation_margin_gamma - control_action_mse_loss + annotation_action_mse_loss
+                        annotation_margin_gamma - control_action_l1_loss + annotation_action_l1_loss
                     )
                     loss = loss + annotation_margin_lambda * annotation_margin_loss
-                    metrics["annotation_action_mse_loss"] = annotation_action_mse_loss.item()
-                    metrics["control_action_mse_loss"] = control_action_mse_loss.item()
+                    metrics["annotation_action_l1_loss"] = annotation_action_l1_loss.item()
+                    metrics["control_action_l1_loss"] = control_action_l1_loss.item()
                     metrics["annotation_margin_loss"] = annotation_margin_loss.item()
 
         if use_diffusion:
@@ -1321,8 +1319,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         recent_metrics["action_l1_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
         recent_metrics["annotation_ce_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
     if cfg.use_annotation_margin_loss and cfg.annotation_margin_lambda > 0:
-        recent_metrics["annotation_action_mse_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
-        recent_metrics["control_action_mse_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
+        recent_metrics["annotation_action_l1_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
+        recent_metrics["control_action_l1_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
         recent_metrics["annotation_margin_loss"] = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Start training
